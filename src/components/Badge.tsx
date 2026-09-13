@@ -1,12 +1,30 @@
-const COLOR_MAP: Record<string, string> = {
-  VERIFIED: 'badge-green', ACTIVE: 'badge-green', EXECUTED: 'badge-green', SIGNED: 'badge-green', COMPLETED: 'badge-green', RESOLVED: 'badge-green',
-  PENDING: 'badge-warning', IN_REVIEW: 'badge-warning', TRANSMITTED: 'badge-warning', PARTIALLY_EXECUTED: 'badge-warning', TERM_SHEET: 'badge-warning', OPEN: 'badge-warning', IN_DISCUSSION: 'badge-warning', MEETING_SCHEDULED: 'badge-warning', CONTACTED: 'badge-warning',
-  REJECTED: 'badge-danger', DECLINED: 'badge-danger', CANCELLED: 'badge-danger', FAILED: 'badge-danger', CLOSED: 'badge-danger',
-  NOT_STARTED: 'badge-gray', PROSPECT: 'badge-gray', SIMULATED_ONLY: 'badge-gray',
-  LIVE: 'badge-blue', PARTNER_IN_PROGRESS: 'badge-blue',
-};
+import { label as labelOf, tone as toneOf, type LabelKind, type Tone } from '../labels';
 
-export default function Badge({ value }: { value: string }) {
-  const cls = COLOR_MAP[value] || 'badge-gray';
-  return <span className={`badge ${cls}`}>{value.replace(/_/g, ' ')}</span>;
+interface Props {
+  value: string | boolean | null | undefined;
+  /** Énumération d'origine : choisit le libellé français et la teinte sémantique. */
+  kind?: LabelKind;
+  /** Libellé forcé (sinon déduit de `kind` + `value`). */
+  label?: string;
+  tone?: Tone;
+  className?: string;
+}
+
+/** Pastille d'état : le texte est toujours présent, la couleur n'est jamais le seul indicateur. */
+export default function Badge({ value, kind, label, tone, className }: Props) {
+  if (value === null || value === undefined || value === '') {
+    return <span className={`badge badge-neutral ${className ?? ''}`.trim()}>—</span>;
+  }
+  const t = tone ?? toneOf(kind, value);
+  const text = label ?? (kind ? labelOf(kind, value) : typeof value === 'boolean' ? labelOf('boolean', value) : fallback(value));
+  return (
+    <span className={`badge badge-${t} ${className ?? ''}`.trim()} title={typeof value === 'string' && value !== text ? value : undefined}>
+      {text}
+    </span>
+  );
+}
+
+function fallback(key: string): string {
+  const words = key.replace(/[_-]+/g, ' ').trim().toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : '—';
 }

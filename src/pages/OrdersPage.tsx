@@ -1,163 +1,269 @@
-import { useEffect, useState } from 'react';
-import { api, BASE_URL } from '../api';
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { api } from '../api';
+import type { Order, OrderReviewInput, OrderStatus, PendingApproval } from '../api/types';
+import { useAuth } from '../auth';
+import ApprovalNotice from '../components/ApprovalNotice';
 import Badge from '../components/Badge';
+import Button from '../components/Button';
+import { CopyButton } from '../components/Copyable';
+import DataTable from '../components/DataTable';
+import DateTime from '../components/DateTime';
+import { SelectField, TextAreaField, TextField } from '../components/Field';
+import FilterBar, { FilterSelect, FilterText } from '../components/FilterBar';
+import { useFilters } from '../useFilters';
+import Modal from '../components/Modal';
+import Money from '../components/Money';
+import PageHeader from '../components/PageHeader';
+import { formatNumber, parseNumber } from '../format';
+import { useBusy, useLoad } from '../hooks';
+import { label, options } from '../labels';
 
-interface OrderRow {
-  id: string;
-  side: string;
-  quantity: string;
-  estimatedPrice: string;
-  estimatedTotal: string;
-  status: string;
-  executionTier: string;
-  marketId: string;
-  partnerReference: string | null;
-  instrument: { symbol: string; currency: string };
-  market: { code: string };
-  partner: { name: string } | null;
-  user: { fullName: string; email: string };
-  submittedAt: string;
+const STATUS_FILTER: OrderStatus[] = ['PENDING', 'TRANSMITTED', 'ACKNOWLEDGED', 'PARTIALLY_EXECUTED', 'EXECUTED', 'REJECTED', 'CANCELLED', 'EXPIRED', 'ADJUSTED'];
+const REVIEW_STATUSES: OrderStatus[] = ['EXECUTED', 'PARTIALLY_EXECUTED', 'REJECTED', 'CANCELLED', 'ADJUSTED'];
+const EXECUTED_STATUSES = new Set<OrderStatus>(['EXECUTED', 'PARTIALLY_EXECUTED', 'ADJUSTED']);
+const REVIEWABLE = new Set<OrderStatus>(['PENDING', 'TRANSMITTED', 'ACKNOWLEDGED', 'PARTIALLY_EXECUTED']);
+
+interface ReviewForm {
+  status: OrderStatus;
+  executedPrice: string;
+  executedQuantity: string;
+  sdbRef: string;
+  reason: string;
 }
 
-interface Market { id: string; code: string; }
+type Errors = Record<string, string>;
+
+function remainingQty(o: Order): number {
+  return Math.max(0, parseNumber(o.quantity) - (parseNumber(o.filledQuantity) || 0));
+}
+
+function validateReview(f: ReviewForm, order: Order): Errors {
+  const e: Errors = {};
+  if (EXECUTED_STATUSES.has(f.status)) {
+    const p = parseNumber(f.executedPrice);
+    if (!Number.isFinite(p) || p <= 0) e.executedPrice = 'Indiquez un prix d’exécution strictement positif.';
+  }
+  if (f.status === 'PARTIALLY_EXECUTED') {
+    const q = parseNumber(f.executedQuantity);
+    const remaining = remainingQty(order);
+    if (!Number.isFinite(q) || q <= 0) e.executedQuantity = 'Indiquez une quantité exécutée strictement positive.';
+    else if (q > remaining) e.executedQuantity = `La quantité ne peut pas dépasser le reste à exécuter (${formatNumber(remaining)}).`;
+  } else if (f.executedQuantity.trim()) {
+    const q = parseNumber(f.executedQuantity);
+    if (!Number.isFinite(q) || q <= 0) e.executedQuantity = 'Quantité invalide.';
+  }
+  if (f.reason.trim().length < 3) e.reason = 'Le motif est obligatoire.';
+  return e;
+}
 
 export default function OrdersPage() {
-  const [orders, setOrders] = useState<OrderRow[]>([]);
-  const [markets, setMarkets] = useState<Market[]>([]);
-  const [statusFilter, setStatusFilter] = useState('');
-  const [marketFilter, setMarketFilter] = useState('');
-  const [reviewing, setReviewing] = useState<OrderRow | null>(null);
-  const [reviewForm, setReviewForm] = useState({ status: 'EXECUTED', executedPrice: '', partnerReference: '', rejectionReason: '' });
-  const [busy, setBusy] = useState(false);
+  const { can } = useAuth();
+  const review = can('orders.review');
+  const f = useFilters({ marketId: '', status: '', batchId: '' });
+  const { marketId, status, batchId } = f.values;
 
-  const load = () => {
-    const params = new URLSearchParams();
-    if (statusFilter) params.set('status', statusFilter);
-    if (marketFilter) params.set('marketId', marketFilter);
-    api.get<OrderRow[]>(`/orders?${params.toString()}`).then(setOrders);
-  };
+  const markets = useLoad(() => api.markets.list(), []);
+  const orders = useLoad(() => api.orders.list({ marketId, status, batchId }), [marketId, status, batchId]);
+  const { busy, run } = useBusy();
 
-  useEffect(() => { api.get<Market[]>('/markets').then(setMarkets); }, []);
-  useEffect(load, [statusFilter, marketFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [reviewing, setReviewing] = useState<Order | null>(null);
+  const [form, setForm] = useState<ReviewForm>({ status: 'EXECUTED', executedPrice: '', executedQuantity: '', sdbRef: '', reason: '' });
+  const [errors, setErrors] = useState<Errors>({});
+  const [approval, setApproval] = useState<PendingApproval | null>(null);
 
-  const openReview = (o: OrderRow) => {
+  const openReview = (o: Order) => {
+    setForm({ status: 'EXECUTED', executedPrice: o.estimatedPrice ?? '', executedQuantity: String(remainingQty(o)), sdbRef: o.sdbRef ?? '', reason: '' });
+    setErrors({});
+    setApproval(null);
     setReviewing(o);
-    setReviewForm({ status: 'EXECUTED', executedPrice: o.estimatedPrice, partnerReference: '', rejectionReason: '' });
   };
 
   const submitReview = async () => {
     if (!reviewing) return;
-    setBusy(true);
-    try {
-      await api.patch(`/orders/${reviewing.id}/review`, {
-        status: reviewForm.status,
-        executedPrice: reviewForm.status !== 'REJECTED' ? Number(reviewForm.executedPrice) : undefined,
-        partnerReference: reviewForm.partnerReference || undefined,
-        rejectionReason: reviewForm.status === 'REJECTED' ? reviewForm.rejectionReason : undefined,
-      });
-      setReviewing(null);
-      load();
-    } finally {
-      setBusy(false);
-    }
+    const errs = validateReview(form, reviewing);
+    setErrors(errs);
+    if (Object.keys(errs).length > 0) return;
+    const body: OrderReviewInput = {
+      status: form.status,
+      executedPrice: EXECUTED_STATUSES.has(form.status) ? parseNumber(form.executedPrice) : undefined,
+      executedQuantity: form.executedQuantity.trim() && EXECUTED_STATUSES.has(form.status) ? parseNumber(form.executedQuantity) : undefined,
+      sdbRef: form.sdbRef.trim() || undefined,
+      reason: form.reason.trim(),
+    };
+    const res = await run(() => api.orders.review(reviewing.id, body), 'Demande de revue créée : elle sera appliquée après validation à deux yeux.');
+    if (res === undefined) return;
+    setApproval(res);
+    orders.reload();
   };
+
+  const currencyOf = (o: Order) => o.instrument?.currency ?? 'XAF';
+  const marketOptions = (markets.data ?? []).map((m) => ({ value: m.id, label: m.code }));
 
   return (
     <div>
-      <h1 className="page-title">Ordres</h1>
-      <p className="page-subtitle">
-        Module 9.3 — vue globale des ordres et rapprochement avec les confirmations d’exécution des
-        partenaires SDB/SGI.
-      </p>
+      <PageHeader title="Ordres" subtitle="Suivez les ordres des clients et saisissez les exécutions confirmées par le partenaire boursier." breadcrumb={[{ label: 'Marchés' }, { label: 'Ordres' }]} />
 
-      <div className="toolbar">
-        <select style={{ maxWidth: 220 }} value={marketFilter} onChange={(e) => setMarketFilter(e.target.value)}>
-          <option value="">Tous les marchés</option>
-          {markets.map((m) => <option key={m.id} value={m.id}>{m.code}</option>)}
-        </select>
-        <select style={{ maxWidth: 220 }} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="">Tous les statuts</option>
-          {['PENDING', 'TRANSMITTED', 'PARTIALLY_EXECUTED', 'EXECUTED', 'REJECTED', 'CANCELLED'].map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
-        {marketFilter && (
-          <a className="btn btn-outline btn-sm" href={`${BASE_URL}/markets/${marketFilter}/orders/export`} target="_blank" rel="noreferrer">
-            Exporter le fichier (Palier 1)
-          </a>
-        )}
-      </div>
+      {approval && !reviewing && <ApprovalNotice approval={approval} />}
 
-      <div className="card">
-        <table>
-          <thead>
-            <tr>
-              <th>Client</th><th>Marché</th><th>Valeur</th><th>Sens</th><th>Qté</th><th>Montant est.</th>
-              <th>Partenaire</th><th>Palier</th><th>Statut</th><th />
-            </tr>
-          </thead>
-          <tbody>
-            {orders.map((o) => (
-              <tr key={o.id}>
-                <td>{o.user.fullName}</td>
-                <td>{o.market.code}</td>
-                <td>{o.instrument.symbol}</td>
-                <td>{o.side}</td>
-                <td>{o.quantity}</td>
-                <td>{o.estimatedTotal} {o.instrument.currency}</td>
-                <td>{o.partner?.name ?? '—'}</td>
-                <td style={{ fontSize: 11 }}>{o.executionTier.replace('TIER', 'T')}</td>
-                <td><Badge value={o.status} /></td>
-                <td>
-                  {(o.status === 'TRANSMITTED' || o.status === 'PENDING') && (
-                    <button className="btn btn-sm btn-outline" onClick={() => openReview(o)}>Traiter</button>
+      <FilterBar active={f.active} onReset={f.reset} onRefresh={orders.reload} refreshing={orders.loading}>
+        <FilterSelect label="Marché" value={marketId} onChange={(v) => f.set('marketId', v)} allLabel="Tous les marchés" options={marketOptions} />
+        <FilterSelect label="Statut" value={status} onChange={(v) => f.set('status', v)} allLabel="Tous les statuts" options={options('order', STATUS_FILTER)} />
+        <FilterText label="Identifiant de lot" placeholder="Identifiant complet du lot" value={batchId} onChange={(v) => f.set('batchId', v)} wide />
+      </FilterBar>
+
+      <div className="card card-table">
+        <DataTable<Order>
+          caption="Ordres"
+          loading={orders.loading}
+          rows={orders.data}
+          rowKey={(o) => o.id}
+          minWidth={960}
+          empty={{
+            kind: 'orders',
+            title: f.active ? 'Aucun ordre pour ces filtres' : 'Aucun ordre',
+            hint: f.active ? 'Élargissez les critères ou réinitialisez les filtres.' : 'Les ordres passés par les clients dans l’application apparaîtront ici.',
+          }}
+          columns={[
+            { key: 'date', header: 'Soumis le', nowrap: true, render: (o) => <DateTime value={o.submittedAt} /> },
+            {
+              key: 'user',
+              header: 'Client',
+              render: (o) => (
+                <>
+                  <strong>{o.user?.fullName}</strong>
+                  <span className="cell-sub">{o.user?.email}</span>
+                </>
+              ),
+            },
+            { key: 'market', header: 'Marché', priority: 'secondary', render: (o) => o.market?.code },
+            {
+              key: 'instr',
+              header: 'Valeur',
+              render: (o) => (
+                <span title={o.instrument?.name}>
+                  <strong>{o.instrument?.symbol}</strong>
+                  {o.instrument?.isin && <span className="cell-sub mono">{o.instrument.isin}</span>}
+                </span>
+              ),
+            },
+            { key: 'side', header: 'Sens', render: (o) => <Badge kind="orderSide" value={o.side} /> },
+            { key: 'qty', header: 'Quantité', align: 'right', numeric: true, render: (o) => formatNumber(o.quantity) },
+            { key: 'price', header: 'Prix estimé', align: 'right', numeric: true, priority: 'secondary', render: (o) => <Money value={o.estimatedPrice} currency={currencyOf(o)} /> },
+            { key: 'max', header: 'Montant max', align: 'right', numeric: true, priority: 'detail', render: (o) => <Money value={o.maxAmount} currency={currencyOf(o)} /> },
+            {
+              key: 'filled',
+              header: 'Exécuté',
+              align: 'right',
+              numeric: true,
+              priority: 'secondary',
+              render: (o) => (
+                <>
+                  {formatNumber(o.filledQuantity)}
+                  {o.avgExecutedPrice && (
+                    <span className="cell-sub">
+                      <Money value={o.avgExecutedPrice} currency={currencyOf(o)} />
+                    </span>
                   )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                </>
+              ),
+            },
+            { key: 'status', header: 'Statut', render: (o) => <Badge kind="order" value={o.status} /> },
+            { key: 'sim', header: 'Mode', priority: 'detail', render: (o) => <Badge kind="liveTrading" value={o.simulated ? 'SIMULATED' : 'LIVE'} /> },
+            { key: 'sdb', header: 'Réf. SDB', priority: 'detail', render: (o) => (o.sdbRef ? <span className="mono">{o.sdbRef}</span> : <span className="muted">—</span>) },
+            {
+              key: 'batch',
+              header: 'Lot',
+              priority: 'detail',
+              render: (o) =>
+                o.batchId ? (
+                  <span className="copyable">
+                    <Link to={`/batches?id=${o.batchId}`} title={o.batchId} className="mono">
+                      {o.batchId.slice(0, 8)}…
+                    </Link>
+                    <CopyButton value={o.batchId} what="l’identifiant du lot" />
+                  </span>
+                ) : (
+                  <span className="muted">—</span>
+                ),
+            },
+            {
+              key: 'actions',
+              header: <span className="sr-only">Actions</span>,
+              align: 'right',
+              render: (o) =>
+                review && REVIEWABLE.has(o.status) ? (
+                  <Button size="sm" onClick={() => openReview(o)}>
+                    Traiter
+                  </Button>
+                ) : null,
+            },
+          ]}
+        />
       </div>
 
       {reviewing && (
-        <div className="modal-backdrop" onClick={() => setReviewing(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>Rapprochement — {reviewing.instrument.symbol}</h3>
-            <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-              {reviewing.user.fullName} · {reviewing.side} {reviewing.quantity} · via {reviewing.partner?.name ?? 'mode simulé'}
-            </p>
-            <div className="form-row">
-              <label>Résultat</label>
-              <select value={reviewForm.status} onChange={(e) => setReviewForm({ ...reviewForm, status: e.target.value })}>
-                <option value="EXECUTED">Exécuté</option>
-                <option value="PARTIALLY_EXECUTED">Partiellement exécuté</option>
-                <option value="REJECTED">Rejeté</option>
-                <option value="CANCELLED">Annulé</option>
-              </select>
-            </div>
-            {reviewForm.status !== 'REJECTED' && reviewForm.status !== 'CANCELLED' ? (
-              <>
-                <div className="form-row">
-                  <label>Prix d’exécution confirmé</label>
-                  <input type="number" step="0.01" value={reviewForm.executedPrice} onChange={(e) => setReviewForm({ ...reviewForm, executedPrice: e.target.value })} />
+        <Modal
+          title={`Revue — ${reviewing.instrument?.symbol} · ${label('orderSide', reviewing.side).toLowerCase()} ${formatNumber(reviewing.quantity)}`}
+          description={
+            <>
+              {reviewing.user?.fullName} · {reviewing.market?.code} · statut actuel <Badge kind="order" value={reviewing.status} /> · reste à exécuter {formatNumber(remainingQty(reviewing))} · prix estimé{' '}
+              <Money value={reviewing.estimatedPrice} currency={currencyOf(reviewing)} />
+            </>
+          }
+          onClose={() => setReviewing(null)}
+          width={600}
+          footer={
+            <>
+              <Button onClick={() => setReviewing(null)} disabled={busy}>
+                {approval ? 'Fermer' : 'Annuler'}
+              </Button>
+              {!approval && (
+                <Button variant="primary" onClick={() => void submitReview()} busy={busy}>
+                  Soumettre la revue
+                </Button>
+              )}
+            </>
+          }
+        >
+          {approval ? (
+            <ApprovalNotice approval={approval} />
+          ) : (
+            <>
+              <ApprovalNotice />
+              <SelectField label="Résultat" value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value as OrderStatus })} required>
+                {options('order', REVIEW_STATUSES).map((s) => (
+                  <option key={s.value} value={s.value}>
+                    {s.label}
+                  </option>
+                ))}
+              </SelectField>
+              {EXECUTED_STATUSES.has(form.status) && (
+                <div className="grid grid-2">
+                  <TextField
+                    label={`Prix d’exécution (${currencyOf(reviewing)})`}
+                    inputMode="decimal"
+                    value={form.executedPrice}
+                    onChange={(e) => setForm({ ...form, executedPrice: e.target.value })}
+                    error={errors.executedPrice}
+                    required
+                  />
+                  <TextField
+                    label="Quantité exécutée"
+                    inputMode="numeric"
+                    value={form.executedQuantity}
+                    onChange={(e) => setForm({ ...form, executedQuantity: e.target.value })}
+                    error={errors.executedQuantity}
+                    hint={`Reste à exécuter : ${formatNumber(remainingQty(reviewing))}${form.status === 'PARTIALLY_EXECUTED' ? '' : ' (optionnel)'}`}
+                    required={form.status === 'PARTIALLY_EXECUTED'}
+                  />
                 </div>
-                <div className="form-row">
-                  <label>Référence partenaire</label>
-                  <input value={reviewForm.partnerReference} onChange={(e) => setReviewForm({ ...reviewForm, partnerReference: e.target.value })} placeholder="Ex. n° de confirmation SDB/SGI" />
-                </div>
-              </>
-            ) : (
-              <div className="form-row">
-                <label>Motif</label>
-                <input value={reviewForm.rejectionReason} onChange={(e) => setReviewForm({ ...reviewForm, rejectionReason: e.target.value })} />
-              </div>
-            )}
-            <div style={{ display: 'flex', gap: 10, marginTop: 6 }}>
-              <button className="btn btn-primary" disabled={busy} onClick={submitReview}>Confirmer</button>
-              <button className="btn btn-outline" onClick={() => setReviewing(null)}>Annuler</button>
-            </div>
-          </div>
-        </div>
+              )}
+              <TextField label="Référence SDB" value={form.sdbRef} onChange={(e) => setForm({ ...form, sdbRef: e.target.value })} placeholder="N° de confirmation partenaire" hint="Optionnelle." />
+              <TextAreaField label="Motif" rows={3} value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} error={errors.reason} required hint="Tracé dans le journal d’audit et visible du valideur." />
+            </>
+          )}
+        </Modal>
       )}
     </div>
   );

@@ -1,7 +1,10 @@
 import { useState, type FormEvent } from 'react';
 import { Navigate } from 'react-router-dom';
 import { useAuth } from '../auth';
-import { ApiError } from '../api';
+import { errorMessage } from '../api';
+import Button from '../components/Button';
+import { TextField } from '../components/Field';
+import { environmentInfo } from '../env';
 
 export default function LoginPage() {
   const { user, login } = useAuth();
@@ -12,14 +15,16 @@ export default function LoginPage() {
 
   if (user) return <Navigate to="/" replace />;
 
+  const env = environmentInfo();
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
     setSubmitting(true);
     try {
-      await login(identifier, password);
+      await login(identifier.trim(), password);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Connexion impossible.');
+      setError(errorMessage(err, 'Connexion impossible. Vérifiez vos identifiants.'));
     } finally {
       setSubmitting(false);
     }
@@ -27,39 +32,58 @@ export default function LoginPage() {
 
   return (
     <div className="login-screen">
-      <form className="login-card" onSubmit={onSubmit}>
-        <div style={{ fontWeight: 800, fontSize: 20, color: 'var(--alke-blue-dark)', marginBottom: 4 }}>
-          AlKÉ Finance
-        </div>
-        <div style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 24 }}>
-          Console d’administration — accès réservé aux équipes internes
-        </div>
-
-        <div className="form-row">
-          <label>E-mail</label>
-          <input
-            type="text"
-            value={identifier}
-            onChange={(e) => setIdentifier(e.target.value)}
-            placeholder="admin@alke.finance"
-            required
-          />
-        </div>
-        <div className="form-row">
-          <label>Mot de passe</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-          />
+      <form className="login-card" onSubmit={onSubmit} aria-labelledby="login-title" noValidate>
+        <div className="login-brand">
+          <span className="brand-mark" aria-hidden="true">
+            A
+          </span>
+          <div>
+            <div id="login-title" className="login-title">
+              AlKÉ Finance
+            </div>
+            <div className="login-sub">Back-office opérations, conformité et support</div>
+          </div>
         </div>
 
-        {error && <div className="error-text">{error}</div>}
+        <TextField
+          id="login-identifier"
+          label="E-mail ou téléphone"
+          type="text"
+          autoComplete="username"
+          autoFocus
+          value={identifier}
+          onChange={(e) => setIdentifier(e.target.value)}
+          required
+          error={error && !identifier.trim() ? 'Indiquez votre identifiant.' : undefined}
+        />
+        <TextField
+          id="login-password"
+          label="Mot de passe"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+        />
 
-        <button className="btn btn-primary" type="submit" disabled={submitting} style={{ width: '100%', marginTop: 8 }}>
-          {submitting ? 'Connexion…' : 'Se connecter'}
-        </button>
+        {error && (
+          <div className="notice notice-danger login-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        <Button variant="primary" type="submit" busy={submitting} className="btn-block">
+          Se connecter
+        </Button>
+
+        <p className="login-footer">
+          Accès réservé au personnel autorisé — toute action est journalisée.
+          <span className="login-env">
+            <span className={`env-pill env-${env.tone}`}>
+              {env.name} · {env.host}
+            </span>
+          </span>
+        </p>
       </form>
     </div>
   );

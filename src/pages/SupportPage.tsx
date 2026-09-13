@@ -1,100 +1,150 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api';
+import type { SupportTicket, TicketStatus } from '../api/types';
+import { useAuth } from '../auth';
 import Badge from '../components/Badge';
+import Button from '../components/Button';
+import DataTable from '../components/DataTable';
+import DateTime from '../components/DateTime';
+import EmptyState from '../components/EmptyState';
+import { TextAreaField } from '../components/Field';
+import FilterBar, { FilterSelect } from '../components/FilterBar';
+import { useFilters } from '../useFilters';
+import PageHeader from '../components/PageHeader';
+import { useBusy, useLoad } from '../hooks';
+import { label, options } from '../labels';
+import { toast } from '../toast';
 
-interface Message { id: string; authorType: string; body: string; createdAt: string; }
-interface Ticket {
-  id: string;
-  subject: string;
-  category: string;
-  status: string;
-  priority: string;
-  user: { fullName: string; email: string };
-  messages: Message[];
-}
+const STATUSES: TicketStatus[] = ['OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED'];
 
 export default function SupportPage() {
-  const [tickets, setTickets] = useState<Ticket[]>([]);
-  const [open, setOpen] = useState<Ticket | null>(null);
+  const { can } = useAuth();
+  const manage = can('support.manage');
+  const f = useFilters({ status: '' });
+  const { status } = f.values;
+  const { data, loading, reload } = useLoad(() => api.support.tickets({ status }), [status]);
+  const { busy, run } = useBusy();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reply, setReply] = useState('');
-  const [busy, setBusy] = useState(false);
 
-  const load = () => api.get<Ticket[]>('/admin/support/tickets').then(setTickets);
-  useEffect(() => { load(); }, []);
+  const tickets = data ?? [];
+  const selected = tickets.find((t) => t.id === selectedId) ?? null;
 
   const send = async () => {
-    if (!open || !reply.trim()) return;
-    setBusy(true);
-    try {
-      await api.post(`/admin/support/tickets/${open.id}/messages`, { body: reply });
-      await api.patch(`/admin/support/tickets/${open.id}`, { status: 'IN_PROGRESS' });
-      setReply('');
-      const updated = await api.get<Ticket[]>('/admin/support/tickets');
-      setTickets(updated);
-      setOpen(updated.find((t) => t.id === open.id) ?? null);
-    } finally {
-      setBusy(false);
-    }
+    if (!selected || !reply.trim()) return;
+    const res = await run(async () => {
+      await api.support.addMessage(selected.id, reply.trim());
+      // Seul un ticket encore OPEN passe en cours : on ne rétrograde jamais un ticket résolu/clos.
+      if (selected.status === 'OPEN') await api.support.setStatus(selected.id, 'IN_PROGRESS');
+      return true;
+    }, 'Réponse envoyée.');
+    if (res === undefined) return;
+    setReply('');
+    reload();
   };
 
-  const close = async () => {
-    if (!open) return;
-    await api.patch(`/admin/support/tickets/${open.id}`, { status: 'RESOLVED' });
-    setOpen(null);
-    load();
+  const resolve = async () => {
+    if (!selected) return;
+    if (selected.status === 'RESOLVED' || selected.status === 'CLOSED') {
+      toast.info('Ce ticket est déjà résolu.');
+      return;
+    }
+    const res = await run(() => api.support.setStatus(selected.id, 'RESOLVED'), 'Ticket marqué résolu.');
+    if (res === undefined) return;
+    reload();
   };
 
   return (
     <div>
-      <h1 className="page-title">Support client</h1>
-      <p className="page-subtitle">Module 8 — suivi des tickets et réclamations.</p>
+      <PageHeader title="Support client" subtitle="Répondez aux demandes et réclamations des clients, suivez leur avancement et clôturez-les une fois traitées." breadcrumb={[{ label: 'Opérations' }, { label: 'Support' }]} />
 
-      <div className="grid" style={{ gridTemplateColumns: '1fr 1.4fr', gap: 20 }}>
-        <div className="card">
-          <table>
-            <thead><tr><th>Sujet</th><th>Client</th><th>Statut</th></tr></thead>
-            <tbody>
-              {tickets.map((t) => (
-                <tr key={t.id} style={{ cursor: 'pointer' }} onClick={() => setOpen(t)}>
-                  <td>{t.subject}</td>
-                  <td>{t.user.fullName}</td>
-                  <td><Badge value={t.status} /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <FilterBar active={f.active} onReset={f.reset} onRefresh={reload} refreshing={loading}>
+        <FilterSelect label="Statut" value={status} onChange={(v) => f.set('status', v)} allLabel="Tous les statuts" options={options('ticket', STATUSES)} />
+      </FilterBar>
+
+      <div className="split">
+        <div className="card card-table">
+          <DataTable<SupportTicket>
+            caption="Tickets"
+            loading={loading}
+            rows={tickets}
+            rowKey={(t) => t.id}
+            minWidth={0}
+            empty={{ kind: 'inbox', title: f.active ? 'Aucun ticket dans ce statut' : 'Aucun ticket', hint: 'Les demandes envoyées par les clients depuis l’application apparaîtront ici.' }}
+            onRowClick={(t) => {
+              setSelectedId(t.id);
+              setReply('');
+            }}
+            columns={[
+              {
+                key: 'subject',
+                header: 'Sujet',
+                render: (t) => (
+                  <>
+                    <strong>{t.subject}</strong>
+                    <span className="cell-sub">
+                      {t.category} · priorité {label('ticketPriority', t.priority).toLowerCase()}
+                    </span>
+                  </>
+                ),
+              },
+              { key: 'user', header: 'Client', priority: 'secondary', render: (t) => t.user?.fullName },
+              { key: 'status', header: 'Statut', render: (t) => <Badge kind="ticket" value={t.status} /> },
+              { key: 'created', header: 'Créé le', priority: 'detail', nowrap: true, render: (t) => <DateTime value={t.createdAt} /> },
+            ]}
+          />
         </div>
 
         <div className="card">
-          {!open ? (
-            <div className="empty-state">Sélectionnez un ticket.</div>
+          {!selected ? (
+            <EmptyState kind="inbox" title="Sélectionnez un ticket" hint="Le fil de discussion et la zone de réponse s’afficheront ici." compact />
           ) : (
             <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <div className="row-between">
                 <div>
-                  <strong>{open.subject}</strong>
-                  <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>{open.user.fullName} · {open.category}</div>
+                  <strong>{selected.subject}</strong>
+                  <div className="muted small">
+                    {selected.user?.fullName} · {selected.user?.email} · {selected.category} · priorité {label('ticketPriority', selected.priority).toLowerCase()}
+                  </div>
                 </div>
-                <Badge value={open.status} />
+                <Badge kind="ticket" value={selected.status} />
               </div>
-              <div style={{ margin: '16px 0', maxHeight: 260, overflowY: 'auto' }}>
-                {open.messages.map((m) => (
-                  <div key={m.id} style={{ marginBottom: 10, textAlign: m.authorType === 'AGENT' ? 'right' : 'left' }}>
-                    <div style={{
-                      display: 'inline-block', padding: '8px 12px', borderRadius: 10, fontSize: 13,
-                      background: m.authorType === 'AGENT' ? 'var(--alke-blue)' : '#eef0f5',
-                      color: m.authorType === 'AGENT' ? '#fff' : 'var(--text)',
-                    }}>
-                      {m.body}
-                    </div>
+
+              <div className="thread" aria-label="Fil de discussion" role="log">
+                {selected.messages.length === 0 && <div className="muted small">Aucun message.</div>}
+                {selected.messages.map((m) => (
+                  <div key={m.id} className={`bubble ${m.authorType === 'AGENT' ? 'bubble-agent' : ''}`.trim()}>
+                    <div className="pre-wrap">{m.body}</div>
+                    <time dateTime={m.createdAt}>
+                      {label('authorType', m.authorType)} · <DateTime value={m.createdAt} />
+                    </time>
                   </div>
                 ))}
               </div>
-              <textarea rows={3} value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Répondre au client..." />
-              <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
-                <button className="btn btn-primary" disabled={busy} onClick={send}>Envoyer</button>
-                <button className="btn btn-outline" onClick={close}>Marquer résolu</button>
-              </div>
+
+              {manage ? (
+                <>
+                  <TextAreaField label="Réponse au client" rows={3} value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Votre réponse…" hint="Envoyée au client dans l’application ; le ticket passe « En cours » s’il était ouvert." />
+                  <div className="actions mt-3">
+                    <Button variant="primary" busy={busy} disabled={!reply.trim()} onClick={() => void send()}>
+                      Envoyer
+                    </Button>
+                    {selected.status !== 'RESOLVED' && selected.status !== 'CLOSED' && (
+                      <Button disabled={busy} onClick={() => void resolve()}>
+                        Marquer résolu
+                      </Button>
+                    )}
+                    {can('users.view') && selected.user && (
+                      <Link className="btn btn-outline" to={`/users?search=${encodeURIComponent(selected.user.email)}`}>
+                        Fiche client
+                      </Link>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <p className="muted small">Lecture seule pour votre rôle.</p>
+              )}
             </div>
           )}
         </div>
